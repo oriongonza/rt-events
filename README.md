@@ -27,32 +27,19 @@ That's it.
 
 | | 1 sub | 10 subs | 100 subs | 1 000 subs |
 |---|---|---|---|---|
-| ZST (`struct Tick;`) | 38 ns | 79 ns | 563 ns | 5.07 µs |
-| Small payload | 30 ns | 83 ns | 583 ns | 5.85 µs |
-| Large payload (heap) | 64 ns | 105 ns | 600 ns | — |
+| ZST | 38 ns | 79 ns | 563 ns | 5.07 µs |
+| Small struct | 30 ns | 83 ns | 583 ns | 5.85 µs |
+| Heap payload | 64 ns | 105 ns | 600 ns | — |
 
-No subscribers: **2.8 ns**. Type miss: **25.7 ns**. Bus creation: **27.8 ns**.
-
-Throughput (10 subs, ZST): **~13M emits/sec**.
+Miss: **2.8 ns**. Wrong type: **25.7 ns**. ~13M emits/sec sustained.
 
 `cargo bench` to reproduce.
 
-## Properties
+Zero dependencies. MSRV 1.0. ~200 lines of code, 600+ lines of benchmarks.
 
-- **Zero dependencies.**
-- **MSRV: 1.0.**
-- **~200 lines of code.** Read the whole thing in 10 minutes.
-- **600+ lines of benchmarks.**
-
-## Design
-
-- `T: 'static` is the only bound. No traits, no registration step.
-- The type *is* the subscription key.
-- Subscribers receive `&E`. Clone if you need owned data.
-- Callbacks are sync. [Here's why, and how to work with async.](docs/async-patterns.md)
-- Signals are ZST events: `struct Reload; bus.emit(Reload);`
-
-## Do one thing and do it well.
+`T: 'static` is the only bound. The type *is* the key. No traits, no registration.
+Callbacks are sync. [Async patterns here.](docs/async-patterns.md)
+Signals are ZST events: `struct Reload; bus.emit(Reload);`
 
 ## License
 
