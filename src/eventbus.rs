@@ -5,54 +5,21 @@ use std::collections::HashMap;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SubscriptionId(u64);
 
-/// A single type-erased subscriber.
-///
-/// `call` and `drop` are monomorphized function pointers baked in at subscribe
-/// time for the concrete `(E, F)` pair that produced `data`. Dispatch is a
-/// single indirect call with no vtable double-hop and no runtime downcast.
-///
-/// # Why not `Box<dyn Fn(&dyn Any)>`
-///
-/// The natural encoding pays twice per subscriber invocation:
-/// 1. an indirect call through the `Box<dyn Fn>` vtable, and
-/// 2. a runtime `downcast_ref::<E>()`, which itself makes a vtable call
-///    to `Any::type_id` to check the event's type.
-///
-/// But `EventBus::subscribers[i]` is already partitioned by `TypeId` — every
-/// entry there is guaranteed to be for the same `E`. The downcast is
-/// provably redundant (see `docs/internal/trampoline.md` §9). Replacing the
-/// `Box<dyn Fn>` with a raw `(data, fn ptr)` pair collapses the hot path to
-/// a single direct indirect call.
-///
-/// # Measured impact
-///
-/// Versus `Box<dyn Fn(&dyn Any)>`, same machine (13th-gen Intel P-core,
-/// pinned with `SCHED_RR`), release build, median of 100 criterion samples:
-///
-/// | subscribers | ZST event           | small payload      | large payload |
-/// |-------------|---------------------|--------------------|---------------|
-/// | 10          | 122 → 56 ns  −55%   | 141 → 78 ns  −50%  | 165 → 144 ns −39% |
-/// | 100         | 895 → 290 ns −58%   | 819 → 493 ns −61%  | 796 → 427 ns (noise) |
-/// | 1000        | 6.87 → 3.62 µs −56% | 8.65 → 4.37 µs −29% | —             |
-///
-/// The win scales with subscriber count: at N=1 dispatch cost is dominated
-/// by setup/cache misses and the trampoline is within noise; from N ≥ 10 it's
-/// roughly 2× faster. The miss path (`emit::<E>` when no subscribers exist
-/// for `E`) is unchanged — it doesn't touch this loop.
-///
-/// Cost: `Subscriber` grows from 24 B to 32 B. An 8 B per-subscription
-/// constant against per-dispatch savings that scale with subscribers × emits.
-///
-/// See `docs/internal/trampoline.md` for the safety proof.
+// Type-erased subscriber. `call` and `drop` are monomorphized fn pointers
+// baked in at subscribe time for the concrete `(E, F)`, so dispatch is one
+// indirect call with no vtable double-hop and no runtime downcast.
+//
+// Rationale, measured impact, safety proof, and the rejected SoA layout all
+// live in `docs/internal/trampoline.md` (§2–§5 for safety, §8 for numbers,
+// §10 for SoA).
 struct Subscriber {
-    /// `Box::<F>::into_raw` for the closure registered in [`EventBus::on_impl`].
-    /// Live until this `Subscriber` is dropped.
+    // `Box::<F>::into_raw` for the closure; live until this `Subscriber` drops.
     data: *const (),
-    /// Trampoline monomorphized for the exact `(E, F)` that produced `data`.
-    /// Casts `data` to `&F`, event to `&E`, then invokes `F`.
+    // Trampoline for the exact `(E, F)` that produced `data`: casts `data` to
+    // `&F`, event to `&E`, invokes `F`.
     call: unsafe fn(data: *const (), event: *const ()),
     id: SubscriptionId,
-    /// Destructor monomorphized for the same `F`.
+    // Destructor for the same `F`.
     drop: unsafe fn(data: *const ()),
 }
 
@@ -74,14 +41,13 @@ impl Drop for Subscriber {
 // Subscribe is O(1) amortized.
 // Unsubscribe is O(subscribers) for that event type.
 pub struct EventBus {
-    /// Outer Vec: one entry per registered event type.
-    /// Inner Vec: subscribers for that type. Partitioned by `TypeId` —
-    /// every subscriber at index `i` was registered for the unique `E`
-    /// with `type_index[TypeId::of::<E>()] == i`.
+    // Outer Vec: one entry per registered event type. Inner Vec: subscribers
+    // for that type. Partitioned by `TypeId` — every subscriber at index `i`
+    // was registered for the unique `E` with `type_index[TypeId::of::<E>()] == i`.
     subscribers: Vec<Vec<Subscriber>>,
-    /// TypeId → index into `subscribers`.
+    // TypeId → index into `subscribers`.
     type_index: HashMap<TypeId, usize>,
-    /// Monotonic counter for subscription IDs.
+    // Monotonic counter for subscription IDs.
     next_id: u64,
 }
 
@@ -154,8 +120,8 @@ impl EventBus {
             //   cmp    %end, %r15
             //   jne    loop
             // The indirect call + loop back-edge account for ~96% of dispatch
-            // time; the rest is the load of `sub.data`. See `Subscriber` docs
-            // for measured impact vs the `Box<dyn Fn(&dyn Any)>` encoding.
+            // time; the rest is the load of `sub.data`. Measured impact vs
+            // `Box<dyn Fn(&dyn Any)>`: `docs/internal/trampoline.md` §8.
             for sub in &self.subscribers[idx] {
                 // SAFETY: by the Subscriber invariant (docs/internal/trampoline.md §2),
                 // every entry in `subscribers[idx]` was pushed by `on_impl::<E, Fₛ>`
@@ -194,7 +160,7 @@ impl EventBus {
             .unwrap_or(0)
     }
 
-    /// Resolve or allocate the Vec index for event type `E`.
+    // Resolve or allocate the Vec index for event type `E`.
     fn index_of<E: 'static>(&mut self) -> usize {
         let type_id = TypeId::of::<E>();
         if let Some(&idx) = self.type_index.get(&type_id) {
@@ -213,21 +179,16 @@ impl Default for EventBus {
     }
 }
 
-/// Dispatch trampoline. Monomorphized once per `(E, F)` that appears in a
-/// call to [`EventBus::on`].
-///
-/// # Safety
-///
-/// The caller must ensure:
-///
-/// 1. `data` was produced by `Box::<F>::into_raw(Box::<F>::new(_))` and the
-///    box is still live (not yet freed by [`drop_trampoline`]).
-/// 2. `event` is `&e as *const E as *const ()` for some live `&E` whose
-///    type matches the `E` this trampoline was monomorphized against.
-///
-/// Both preconditions are established by [`EventBus::on_impl`] and
-/// [`EventBus::emit`] together with the `TypeId`-partitioning of
-/// `EventBus::subscribers`. See `docs/internal/trampoline.md` for the proof.
+// Dispatch trampoline. Monomorphized once per `(E, F)` that appears in a
+// call to `EventBus::on`.
+//
+// Safety: caller must ensure
+//   1. `data` came from `Box::<F>::into_raw` and is still live (not yet
+//      freed by `drop_trampoline`).
+//   2. `event` is `&e as *const E as *const ()` for a live `&E` whose type
+//      matches the `E` this trampoline was monomorphized against.
+// Both established by `on_impl` + `emit` + the `TypeId` partitioning of
+// `subscribers`; proof in `docs/internal/trampoline.md` §4.
 unsafe fn call_trampoline<E: 'static, F: Fn(&E)>(data: *const (), event: *const ()) {
     // SAFETY: precondition (1) makes `data as *const F` point to a live `F`.
     let f = unsafe { &*(data as *const F) };
@@ -236,18 +197,13 @@ unsafe fn call_trampoline<E: 'static, F: Fn(&E)>(data: *const (), event: *const 
     f(e);
 }
 
-/// Destructor trampoline. Monomorphized once per `F`.
-///
-/// # Safety
-///
-/// The caller must ensure:
-///
-/// 1. `data` was produced by `Box::<F>::into_raw(Box::<F>::new(_))` and the
-///    box is still live.
-/// 2. This function is called at most once for this `data`.
-///
-/// Invoked only from `Subscriber::drop`, which Rust guarantees runs exactly
-/// once per `Subscriber`.
+// Destructor trampoline. Monomorphized once per `F`.
+//
+// Safety: caller must ensure
+//   1. `data` came from `Box::<F>::into_raw` and is still live.
+//   2. This function is called at most once for this `data`.
+// Invoked only from `Subscriber::drop`, which Rust guarantees runs exactly
+// once per `Subscriber`. Proof in `docs/internal/trampoline.md` §5.
 unsafe fn drop_trampoline<F>(data: *const ()) {
     // SAFETY: by (1) and (2), the box is live and reclaimed exactly once.
     unsafe {

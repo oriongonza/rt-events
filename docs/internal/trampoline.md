@@ -195,3 +195,62 @@ as its `Subscriber`. Together they turn what would be a C-style `void*` +
 function pointer pattern into something the compiler type-checks end to
 end, with the only remaining `unsafe` being the three pointer casts inside
 the trampolines — each discharged by the invariant above.
+
+## 10. Why Not SoA (Split Columns)
+
+Natural next move after this change: split `Vec<Subscriber>` into parallel
+`Vec<*const ()>` (`data`) and `Vec<unsafe fn>` (`call`), leaving `id` / `drop`
+in cold columns. Two hot fields, densely packed, nothing else pulled into L1.
+We measured it. It's ~25% slower.
+
+Same hardware as §8, `emit_zst/1000` with 1000 subs × 2 M emits, `perf stat`,
+3 runs each:
+
+|                     | AoS     | SoA     | Δ      |
+|---------------------|---------|---------|--------|
+| cycles              | 8.14 G  | 10.16 G | +25%   |
+| instructions        | 14.30 G | 14.35 G | ~same  |
+| IPC                 | 1.56    | 1.22    | −22%   |
+| L1-dcache misses    | 15.4 M  | 10.9 M  | **−29%** |
+
+Criterion confirms at the wall-clock level: emit_zst/100 `151 → 178 ns (+17%)`,
+emit_zst/1000 `1.36 → 1.51 µs (+11%)`, emit_large/100 `172 → 213 ns (+24%)`.
+The regression holds from N=1 to N=1000.
+
+The cache-locality theory was right — L1 misses drop 29% because `id` and
+`drop` no longer get pulled into lines the dispatch loop doesn't read. But
+at these working set sizes (≤16 KB across both hot columns) everything fits
+in L1 anyway, so the miss-count win buys nothing. The IPC collapse is what
+we actually feel.
+
+Where the IPC goes: compare the hot loops under `perf annotate`:
+
+    AoS:                                      SoA:
+      mov    0x10(%r13), %rdi    3.4%          mov  0x0(%rbp,%r14,8), %rdi   24.7%
+      mov    %r14, %rsi          —             mov  %r15, %rsi               —
+      call   *0x0(%r13)         61.7%          call *(%rbx,%r14,8)          41.8%
+      add    $0x20, %r13         —             inc  %r14                     —
+      jne    loop               31.6%          jne  loop                    32.2%
+
+Two mechanisms:
+
+1. **Co-located load fusion.** In AoS, `sub.data` and `sub.call` live at
+   offsets 0x10 and 0x0 of the same 32 B struct. Two architecturally distinct
+   loads, but they hit the same cache line and often the same L1 bank in the
+   same cycle — the CPU effectively folds them. The `mov 0x10(%r13), %rdi`
+   costs only 3.4% of cycles because it overlaps with the indirect call's
+   setup. In SoA, `data[i]` and `call[i]` are in two independent vecs, so
+   the CPU can't fuse them — the data load alone now costs 24.7% of cycles.
+
+2. **Dependency chain through indexed addressing.** `call *0x0(%r13)` is a
+   simple displacement load; the address is ready as soon as `%r13` is. In
+   SoA, `call *(%rbx,%r14,8)` requires an AGU op (`rbx + r14*8`) before the
+   load can issue. Every iteration carries `%r14` forward, so the chain
+   from `i` through `call[i]` through the indirect-call target is a cycle
+   longer than AoS's simple pointer advance.
+
+The lesson: cache-locality intuition is a real effect but it only helps when
+you're actually cache-bound. At these working set sizes the dispatch loop is
+dependency-chain bound through the indirect call, and AoS's struct layout
+minimizes that chain. A layout choice that looks better on paper can lose to
+one that the CPU's load pipeline is better at folding.
