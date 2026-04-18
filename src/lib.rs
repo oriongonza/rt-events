@@ -33,6 +33,8 @@
 //! is a channel, a spawned task, or an atomic flag is your business.
 //! The bus dispatches. You decide what to do with the data.
 
+#![forbid(unsafe_code)]
+
 mod eventbus;
 
 pub use eventbus::{EventBus, SubscriptionId};
