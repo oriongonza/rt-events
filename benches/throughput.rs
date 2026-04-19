@@ -60,7 +60,7 @@ fn bench_throughput_payload(c: &mut Criterion) {
                         bus.emit(black_box(GameEvent {
                             entity_id: i as u32,
                             kind: 1,
-                            value: 3.14,
+                            value: 1.5,
                         }));
                     }
                 });

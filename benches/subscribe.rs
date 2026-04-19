@@ -6,7 +6,7 @@ struct Event;
 fn bench_subscribe(c: &mut Criterion) {
     c.bench_function("subscribe_single", |b: &mut criterion::Bencher| {
         b.iter_with_setup(
-            || EventBus::new(),
+            EventBus::new,
             |mut bus: EventBus| {
                 black_box(bus.on(|_: &Event| {}));
             },

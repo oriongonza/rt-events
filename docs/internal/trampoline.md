@@ -254,3 +254,83 @@ you're actually cache-bound. At these working set sizes the dispatch loop is
 dependency-chain bound through the indirect call, and AoS's struct layout
 minimizes that chain. A layout choice that looks better on paper can lose to
 one that the CPU's load pipeline is better at folding.
+
+## 11. Why Not a Fully-Safe Typed Bucket
+
+Obvious follow-up: can the same "check once per emit" trick work without
+raw pointers? Yes. Instead of erasing the subscriber down to
+`Box<dyn Fn(&dyn Any)>`, erase the *bucket* down to `Box<dyn ErasedBucket>`
+where each bucket is concretely `Bucket<E>` for the `E` matching its
+`TypeId` key:
+
+```rust
+struct Bucket<E: 'static> {
+    handlers: Vec<Box<dyn Fn(&E)>>,
+    ids: Vec<SubscriptionId>,
+}
+
+trait ErasedBucket {
+    fn remove(&mut self, id: SubscriptionId) -> bool;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<E: 'static> ErasedBucket for Bucket<E> { /* ... */ }
+
+pub struct EventBus {
+    buckets: HashMap<TypeId, Box<dyn ErasedBucket>>,
+}
+```
+
+Dispatch does one `downcast_ref::<Bucket<E>>()` per emit (hoisted out of
+the inner loop; the `TypeId` key guarantees it succeeds), then a plain
+`for f in &typed.handlers { f(&event); }`. The whole crate goes under
+`#![forbid(unsafe_code)]`. The invariant is the same as §2 but enforced
+by the type system instead of discharged in prose.
+
+I built it and benched it. It lost.
+
+Same hardware as §8 / §10, current code pinned with `taskset -c 6,7`,
+quiet system, 100 samples, `--baseline trampoline`:
+
+| bench              | trampoline | typed-bucket | Δ    |
+|--------------------|-----------:|-------------:|-----:|
+| emit_zst/10        |     23 ns  |        32 ns | +39% |
+| emit_zst/100       |    148 ns  |       199 ns | +34% |
+| emit_zst/1000      |    1.29 µs |      1.80 µs | +40% |
+| small_payload/1    |     14 ns  |        19 ns | +28% |
+| small_payload/100  |    160 ns  |       170 ns |  +7% |
+| small_payload/1000 |    1.44 µs |      1.56 µs |  +8% |
+| large_payload/10   |     48 ns  |        50 ns |  +3% |
+| large_payload/100  |    180 ns  |       188 ns |  +4% |
+| type_miss          |     13 ns  |        15 ns | +15% |
+
+All p < 0.05.
+
+Where the time goes. The trampoline's hot loop is:
+
+    mov    0x10(%r13), %rdi       ; data
+    mov    %r14,       %rsi       ; event
+    call   *0x0(%r13)              ; call
+
+Two loads and an indirect call. The typed-bucket's hot loop is effectively:
+
+    mov    (%rbp,%r14,8), %rbx    ; Box<dyn Fn> → fat pointer
+    mov    (%rbx),        %rdi    ; data (closure state)
+    mov    0x18(%rbx),    %rax    ; vtable slot for Fn::call
+    mov    %r15,          %rsi    ; event
+    call   *%rax
+
+Three loads because the vtable slot has to be fetched before the indirect
+call can target it. That extra load is unhidable on the dependency chain:
+its address depends on `Box<dyn Fn>`'s vtable pointer, which depends on
+`handlers[i]`, which depends on `i`. Can't prefetch it, can't start the
+indirect call without it.
+
+At payloaded workloads the cost hides — the callback body dominates, and
+5-10% extra dispatch overhead gets absorbed. At ZST workloads where
+dispatch itself is the work being measured, it's 40%.
+
+So the trampoline stays. The typed-bucket design is worth knowing about —
+it's the cleanest fully-safe thing you can build with this API — but at
+these speeds the vtable load is real money.

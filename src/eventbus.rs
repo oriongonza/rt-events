@@ -1,26 +1,32 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 
+use crate::{many, single};
+
 /// Opaque handle returned by [`EventBus::on`]. Pass to [`EventBus::off`] to unsubscribe.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SubscriptionId(u64);
 
-// Type-erased subscriber. `call` and `drop` are monomorphized fn pointers
-// baked in at subscribe time for the concrete `(E, F)`, so dispatch is one
-// indirect call with no vtable double-hop and no runtime downcast.
+// Type-erased subscriber record. `call` and `drop` are monomorphized fn
+// pointers baked in at subscribe time for the concrete `(E, F)`, so
+// dispatch is one indirect call with no vtable double-hop and no runtime
+// downcast.
+//
+// Shared between `single::Slot` and `many::List`; each stores one of these
+// (or a Vec of them) inline.
 //
 // Rationale, measured impact, safety proof, and the rejected SoA layout all
 // live in `docs/internal/trampoline.md` (§2–§5 for safety, §8 for numbers,
 // §10 for SoA).
-struct Subscriber {
+pub struct Subscriber {
     // `Box::<F>::into_raw` for the closure; live until this `Subscriber` drops.
-    data: *const (),
+    pub data: *const (),
     // Trampoline for the exact `(E, F)` that produced `data`: casts `data` to
     // `&F`, event to `&E`, invokes `F`.
-    call: unsafe fn(data: *const (), event: *const ()),
-    id: SubscriptionId,
+    pub call: unsafe fn(data: *const (), event: *const ()),
+    pub id: SubscriptionId,
     // Destructor for the same `F`.
-    drop: unsafe fn(data: *const ()),
+    pub drop: unsafe fn(data: *const ()),
 }
 
 impl Drop for Subscriber {
@@ -33,20 +39,26 @@ impl Drop for Subscriber {
     }
 }
 
+// Per-type storage. Auto-specialized by subscriber count:
+//
+//   N = 0  — no entry in `buckets` (HashMap miss path)
+//   N = 1  — `Single(Slot)`, inline, no Vec, no second heap indirection
+//   N ≥ 2  — `Many(List)`, Vec of subscribers
+//
+// Promote on the second `on` for a type; demote on `off` when one survives.
+enum Bucket {
+    Single(single::Slot),
+    Many(many::List),
+}
+
 /// A typed, sync, zero-dependency event bus.
 //
-// `Vec<Vec<Subscriber>>` indexed by event type.
-// `TypeId` maps to a `Vec` index.
-// Dispatch is O(subscribers).
-// Subscribe is O(1) amortized.
-// Unsubscribe is O(subscribers) for that event type.
+// `HashMap<TypeId, Bucket>` where each `Bucket` is one of `single::Slot` or
+// `many::List`. Dispatch is O(subscribers) for the matching type. Subscribe
+// is O(1) amortized. Unsubscribe is O(types) to locate the bucket plus
+// O(subscribers) inside it.
 pub struct EventBus {
-    // Outer Vec: one entry per registered event type. Inner Vec: subscribers
-    // for that type. Partitioned by `TypeId` — every subscriber at index `i`
-    // was registered for the unique `E` with `type_index[TypeId::of::<E>()] == i`.
-    subscribers: Vec<Vec<Subscriber>>,
-    // TypeId → index into `subscribers`.
-    type_index: HashMap<TypeId, usize>,
+    buckets: HashMap<TypeId, Bucket>,
     // Monotonic counter for subscription IDs.
     next_id: u64,
 }
@@ -54,10 +66,10 @@ pub struct EventBus {
 impl EventBus {
     /// Create an empty bus.
     // Allocates nothing until the first subscription.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            subscribers: Vec::new(),
-            type_index: HashMap::new(),
+            buckets: HashMap::new(),
             next_id: 0,
         }
     }
@@ -84,14 +96,28 @@ impl EventBus {
         let id = SubscriptionId(self.next_id);
         self.next_id += 1;
 
-        let idx = self.index_of::<E>();
-
-        self.subscribers[idx].push(Subscriber {
-            data: Box::into_raw(Box::new(callback)) as *const (),
+        let sub = Subscriber {
+            data: Box::into_raw(Box::new(callback)).cast::<()>(),
             call: call_trampoline::<E, F>,
             id,
             drop: drop_trampoline::<F>,
-        });
+        };
+
+        let type_id = TypeId::of::<E>();
+        // remove + match + insert: two HashMap ops in the populated case,
+        // but lets us pattern-match *and* move ownership across variants
+        // without fighting the borrow checker. `on` is not hot.
+        let new_bucket = match self.buckets.remove(&type_id) {
+            None => Bucket::Single(single::Slot::new(sub)),
+            Some(Bucket::Single(old)) => {
+                Bucket::Many(many::List::from_two(old.into_inner(), sub))
+            }
+            Some(Bucket::Many(mut list)) => {
+                list.push(sub);
+                Bucket::Many(list)
+            }
+        };
+        self.buckets.insert(type_id, new_bucket);
 
         id
     }
@@ -107,69 +133,94 @@ impl EventBus {
     /// # let bus = EventBus::new();
     /// bus.emit(Hit { damage: 42 });
     /// ```
+    // Takes `E` by value rather than `&E`: the bus "consumes and delivers",
+    // matching stdlib conventions (`mpsc::Sender::send`, `HashMap::insert`)
+    // and keeping the call site clean (`bus.emit(Event { .. })` without `&`).
+    // Handlers still receive `&E`; the owned value is borrowed internally.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn emit<E: 'static>(&self, event: E) {
-        let type_id = TypeId::of::<E>();
-        if let Some(&idx) = self.type_index.get(&type_id) {
-            let event_ptr = &event as *const E as *const ();
-            // Hot loop. On x86_64 this compiles to:
-            //   mov    0x10(%r15), %rdi     ; sub.data
-            //   mov    <event>, %rsi        ; &event (hoisted)
-            //   call   *(%r15)              ; sub.call  — one indirect call,
-            //                                            no vtable deref
-            //   add    $0x20, %r15
-            //   cmp    %end, %r15
-            //   jne    loop
-            // The indirect call + loop back-edge account for ~96% of dispatch
-            // time; the rest is the load of `sub.data`. Measured impact vs
-            // `Box<dyn Fn(&dyn Any)>`: `docs/internal/trampoline.md` §8.
-            for sub in &self.subscribers[idx] {
-                // SAFETY: by the Subscriber invariant (docs/internal/trampoline.md §2),
-                // every entry in `subscribers[idx]` was pushed by `on_impl::<E, Fₛ>`
-                // for this exact `E` (TypeId injectivity). So `sub.call` is
-                // `call_trampoline::<E, Fₛ>` and `sub.data` is a live `Box<Fₛ>`.
-                // `event_ptr` is `&event as *const E as *const ()` for a live `&E`.
-                // The trampoline's three preconditions are met.
-                unsafe { (sub.call)(sub.data, event_ptr) }
-            }
+        let Some(bucket) = self.buckets.get(&TypeId::of::<E>()) else {
+            return;
+        };
+        let event_ptr = core::ptr::from_ref::<E>(&event).cast::<()>();
+        // One branch on the N=1 vs N≥2 split; each arm's dispatch lives in
+        // its own module. The outer `TypeId` key already proves every
+        // `Subscriber` in the bucket was registered for this exact `E`, so
+        // the dispatch methods only need to know "here is a live `&E`".
+        match bucket {
+            // SAFETY: `event_ptr` is a live `&E`; the slot was built from
+            // `on::<E, _>`, so its trampoline is monomorphized for this `E`.
+            Bucket::Single(slot) => unsafe { slot.dispatch(event_ptr) },
+            // SAFETY: same invariant, applied to every entry in the list.
+            Bucket::Many(list) => unsafe { list.dispatch(event_ptr) },
         }
     }
 
     /// Remove a subscription. Returns `true` if the subscription was found.
     pub fn off(&mut self, id: SubscriptionId) -> bool {
-        for subs in &mut self.subscribers {
-            if let Some(pos) = subs.iter().position(|s| s.id == id) {
-                // dispatch order has no semantic meaning (see `docs/internal/formalism.md`).
-                subs.swap_remove(pos);
-                return true;
+        // First pass: walk buckets to locate the id and update in-place where
+        // possible. Single-matches and demotions need a second step because
+        // they change the bucket variant; record the type id and act after
+        // the borrow on `self.buckets` is released.
+        let mut action = OffAction::NotFound;
+        for (&type_id, bucket) in &mut self.buckets {
+            // Pattern guards can't borrow mutably, so the `list.remove(id)`
+            // check lives in the arm body, not the guard.
+            match bucket {
+                Bucket::Single(slot) => {
+                    if slot.matches(id) {
+                        action = OffAction::DropBucket(type_id);
+                        break;
+                    }
+                }
+                Bucket::Many(list) => {
+                    if list.remove(id) {
+                        action = if list.len() == 1 {
+                            OffAction::Demote(type_id)
+                        } else {
+                            OffAction::Done
+                        };
+                        break;
+                    }
+                }
             }
         }
-        false
+
+        match action {
+            OffAction::NotFound => false,
+            OffAction::Done => true,
+            OffAction::DropBucket(t) => {
+                self.buckets.remove(&t);
+                true
+            }
+            OffAction::Demote(t) => {
+                // `list.into_single()` returns the lone survivor; rewrap
+                // it as a `Single` so the next emit skips the Vec path.
+                if let Some(Bucket::Many(list)) = self.buckets.remove(&t) {
+                    if let Some(sub) = list.into_single() {
+                        self.buckets
+                            .insert(t, Bucket::Single(single::Slot::new(sub)));
+                    }
+                }
+                true
+            }
+        }
     }
 
-    /// Number of registered event types.
+    /// Number of event types with at least one subscriber.
+    #[must_use]
     pub fn type_count(&self) -> usize {
-        self.subscribers.len()
+        self.buckets.len()
     }
 
     /// Number of subscribers for a given event type.
+    #[must_use]
     pub fn subscriber_count<E: 'static>(&self) -> usize {
-        let type_id = TypeId::of::<E>();
-        self.type_index
-            .get(&type_id)
-            .map(|&idx| self.subscribers[idx].len())
-            .unwrap_or(0)
-    }
-
-    // Resolve or allocate the Vec index for event type `E`.
-    fn index_of<E: 'static>(&mut self) -> usize {
-        let type_id = TypeId::of::<E>();
-        if let Some(&idx) = self.type_index.get(&type_id) {
-            return idx;
+        match self.buckets.get(&TypeId::of::<E>()) {
+            None => 0,
+            Some(Bucket::Single(_)) => 1,
+            Some(Bucket::Many(list)) => list.len(),
         }
-        let idx = self.subscribers.len();
-        self.subscribers.push(Vec::new());
-        self.type_index.insert(type_id, idx);
-        idx
     }
 }
 
@@ -177,6 +228,19 @@ impl Default for EventBus {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// What `off` wants to do after it finishes walking the buckets. Separated
+// from the walk to avoid holding a mutable borrow on `self.buckets` while
+// mutating its shape.
+enum OffAction {
+    NotFound,
+    // Removed from a `Many` that still has ≥ 2 subscribers; nothing else to do.
+    Done,
+    // The subscription was in a `Single`; remove the bucket entirely.
+    DropBucket(TypeId),
+    // Removed from a `Many` that now has exactly one; demote to `Single`.
+    Demote(TypeId),
 }
 
 // Dispatch trampoline. Monomorphized once per `(E, F)` that appears in a
@@ -188,12 +252,12 @@ impl Default for EventBus {
 //   2. `event` is `&e as *const E as *const ()` for a live `&E` whose type
 //      matches the `E` this trampoline was monomorphized against.
 // Both established by `on_impl` + `emit` + the `TypeId` partitioning of
-// `subscribers`; proof in `docs/internal/trampoline.md` §4.
-unsafe fn call_trampoline<E: 'static, F: Fn(&E)>(data: *const (), event: *const ()) {
+// `buckets`; proof in `docs/internal/trampoline.md` §4.
+pub unsafe fn call_trampoline<E: 'static, F: Fn(&E)>(data: *const (), event: *const ()) {
     // SAFETY: precondition (1) makes `data as *const F` point to a live `F`.
-    let f = unsafe { &*(data as *const F) };
+    let f = unsafe { &*data.cast::<F>() };
     // SAFETY: precondition (2) makes `event as *const E` point to a live `E`.
-    let e = unsafe { &*(event as *const E) };
+    let e = unsafe { &*event.cast::<E>() };
     f(e);
 }
 
@@ -204,10 +268,10 @@ unsafe fn call_trampoline<E: 'static, F: Fn(&E)>(data: *const (), event: *const 
 //   2. This function is called at most once for this `data`.
 // Invoked only from `Subscriber::drop`, which Rust guarantees runs exactly
 // once per `Subscriber`. Proof in `docs/internal/trampoline.md` §5.
-unsafe fn drop_trampoline<F>(data: *const ()) {
+pub unsafe fn drop_trampoline<F>(data: *const ()) {
     // SAFETY: by (1) and (2), the box is live and reclaimed exactly once.
     unsafe {
-        drop(Box::from_raw(data as *mut F));
+        drop(Box::from_raw(data.cast::<F>().cast_mut()));
     }
 }
 
@@ -411,5 +475,79 @@ mod tests {
         bus.off(id);
         drop(held);
         assert!(weak.upgrade().is_none(), "off() did not drop closure");
+    }
+
+    // Tests for the auto-specialization: Single → Many promotion and
+    // Many → Single demotion. These are impl-visible boundaries and the
+    // public behavior (subscriber_count, emit dispatch, closure lifecycle)
+    // must stay invariant across them.
+
+    #[test]
+    fn promotes_single_to_many_on_second_subscribe() {
+        let mut bus = EventBus::new();
+        let a = Rc::new(Cell::new(false));
+        let b = Rc::new(Cell::new(false));
+
+        let ac = a.clone();
+        bus.on(move |_: &Reload| ac.set(true)); // Single
+        let bc = b.clone();
+        bus.on(move |_: &Reload| bc.set(true)); // Single → Many
+
+        bus.emit(Reload);
+        assert!(a.get(), "first subscriber lost across promotion");
+        assert!(b.get(), "second subscriber not delivered");
+        assert_eq!(bus.subscriber_count::<Reload>(), 2);
+    }
+
+    #[test]
+    fn demotes_many_to_single_on_off_leaving_one() {
+        let mut bus = EventBus::new();
+        let a = Rc::new(Cell::new(0u32));
+        let b = Rc::new(Cell::new(0u32));
+
+        let ac = a.clone();
+        let id_a = bus.on(move |_: &Reload| ac.set(ac.get() + 1));
+        let bc = b.clone();
+        bus.on(move |_: &Reload| bc.set(bc.get() + 1));
+        assert_eq!(bus.subscriber_count::<Reload>(), 2); // Many
+
+        bus.off(id_a); // Many(2) → off → Single(b)
+        assert_eq!(bus.subscriber_count::<Reload>(), 1);
+
+        bus.emit(Reload);
+        assert_eq!(a.get(), 0, "off'd subscriber still receiving");
+        assert_eq!(b.get(), 1, "surviving subscriber dropped on demotion");
+    }
+
+    #[test]
+    fn promotion_preserves_closure_state() {
+        // Promotion moves the Subscriber from Single into a fresh Many without
+        // running its destructor. If that goes wrong, the captured Rc leaks
+        // or double-frees.
+        let held = Rc::new(());
+        let weak = Rc::downgrade(&held);
+
+        {
+            let mut bus = EventBus::new();
+            let c = held.clone();
+            bus.on(move |_: &Reload| {
+                let _ = &c;
+            });
+            bus.on(|_: &Reload| {}); // trigger promotion
+        }
+
+        drop(held);
+        assert!(weak.upgrade().is_none(), "promotion leaked closure capture");
+    }
+
+    #[test]
+    fn off_back_to_zero_drops_bucket() {
+        let mut bus = EventBus::new();
+        let id = bus.on(|_: &Reload| {});
+        assert_eq!(bus.type_count(), 1);
+
+        bus.off(id);
+        assert_eq!(bus.type_count(), 0, "empty bucket was not removed");
+        assert_eq!(bus.subscriber_count::<Reload>(), 0);
     }
 }
