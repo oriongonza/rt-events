@@ -4,7 +4,9 @@ use rt_events::EventBus;
 struct Tick;
 
 struct GameEvent {
+    #[allow(dead_code, reason = "payload size contributor")]
     entity_id: u32,
+    #[allow(dead_code, reason = "payload size contributor")]
     kind: u8,
     value: f32,
 }
@@ -15,7 +17,9 @@ fn bench_throughput_zst(c: &mut Criterion) {
     for n_events in [1_000, 10_000, 100_000, 1_000_000] {
         let mut bus = EventBus::new();
         for _ in 0..10 {
-            bus.on(|_: &Tick| {});
+            bus.on(|e: &Tick| {
+                black_box(e);
+            });
         }
 
         group.throughput(Throughput::Elements(n_events));
@@ -74,9 +78,15 @@ fn bench_mixed_types_throughput(c: &mut Criterion) {
 
     let mut bus = EventBus::new();
     for _ in 0..10 {
-        bus.on(|_: &TypeA| {});
-        bus.on(|_: &TypeB| {});
-        bus.on(|_: &TypeC| {});
+        bus.on(|e: &TypeA| {
+            black_box(e);
+        });
+        bus.on(|e: &TypeB| {
+            black_box(e);
+        });
+        bus.on(|e: &TypeC| {
+            black_box(e);
+        });
     }
 
     let n = 100_000u64;
